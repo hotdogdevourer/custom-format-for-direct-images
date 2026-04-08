@@ -11,7 +11,7 @@
  *  25     | 1    | BitDepth    | 1,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32
  *  26     | 1    | Compression | 0-5
  *  27     | 1    | Filter      | 0=adaptive
- *  28     | 1    | Interlace   | 0-32
+ *  28     | 1    | Interlace   | 0-255 (0=none, N=rearrange rows by stride N)
  *  29     | 4    | CRC         | CRC-32 checksum
  *  33     | 4    | BlockSize   | big-endian, >0
  *  37     | 8    | BlockCount  | big-endian, >0
@@ -20,6 +20,7 @@
  *  61     | 3    | Padding     | 0D 0A 00
  *  64+    | var  | Chunks      | pixel data chunks
  */
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,13 +58,13 @@ static const uint8_t CFDE_MAGIC[16] = {
 #define VIEW_MODE_GRAY    6
 
 #define LAYOUT_NONE          0
-#define LAYOUT_HALF_VERT     1                                                  
-#define LAYOUT_FULL_STRETCHED 2                                                 
-#define LAYOUT_ASPECT        3                                                  
+#define LAYOUT_HALF_VERT     1
+#define LAYOUT_FULL_STRETCHED 2
+#define LAYOUT_ASPECT        3
 #define FLUSH_NONE        0
-#define FLUSH_BUFFER      1                                                 
-#define FLUSH_LINE        2                                             
-#define FLUSH_PIXEL       3                                        
+#define FLUSH_BUFFER      1
+#define FLUSH_LINE        2
+#define FLUSH_PIXEL       3
 
 #define COMP_NONE  0
 #define COMP_MAX   5
@@ -74,29 +75,13 @@ static const uint8_t CFDE_MAGIC[16] = {
 #define CFDE_COMP_HUFFMAN 0x08
 #define CFDE_COMP_XOR     0x10
 
-static void write_u32be(FILE *f, uint32_t v) {
-    uint8_t b[4];
-    b[0] = (uint8_t)((v >> 24) & 0xFF);
-    b[1] = (uint8_t)((v >> 16) & 0xFF);
-    b[2] = (uint8_t)((v >>  8) & 0xFF);
-    b[3] = (uint8_t)( v        & 0xFF);
-    fwrite(b, 1, 4, f);
-}
-
 static uint32_t read_u32be(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
 }
 
-static void write_u64s_be(FILE *f, uint32_t hi, uint32_t lo) {
-    write_u32be(f, hi);
-    write_u32be(f, lo);
-}
 
-static void read_u64s_be(const uint8_t *p, uint32_t *hi, uint32_t *lo) {
-    *hi = read_u32be(p);
-    *lo = read_u32be(p + 4);
-}
+
 
 static uint32_t crc32_table[256];
 static int crc32_ready = 0;
@@ -715,6 +700,54 @@ static void unpack_row(const uint8_t *buf, uint32_t count, int bpp, uint32_t *sa
     }
 }
 
+static void interlace_rows(uint8_t *data, uint32_t width, uint32_t height,
+                           int bpp, int channels, uint8_t interlace) {
+    uint32_t rb = row_bytes(width, bpp, channels);
+    uint8_t *tmp;
+    uint32_t y, src_y, row_idx;
+
+    if (interlace <= 1 || height == 0 || rb == 0) return;
+
+    tmp = (uint8_t*)malloc(height * rb);
+    if (!tmp) return;
+    memcpy(tmp, data, height * rb);
+
+    row_idx = 0;
+    for (y = 0; y < interlace; y++) {
+        for (src_y = y; src_y < height; src_y += interlace) {
+            if (row_idx < height) {
+                memcpy(data + row_idx * rb, tmp + src_y * rb, rb);
+                row_idx++;
+            }
+        }
+    }
+    free(tmp);
+}
+
+static void deinterlace_rows(uint8_t *data, uint32_t width, uint32_t height,
+                             int bpp, int channels, uint8_t interlace) {
+    uint32_t rb = row_bytes(width, bpp, channels);
+    uint8_t *tmp;
+    uint32_t y, src_y, row_idx;
+
+    if (interlace <= 1 || height == 0 || rb == 0) return;
+
+    tmp = (uint8_t*)malloc(height * rb);
+    if (!tmp) return;
+    memcpy(tmp, data, height * rb);
+
+    row_idx = 0;
+    for (y = 0; y < interlace; y++) {
+        for (src_y = y; src_y < height; src_y += interlace) {
+            if (row_idx < height) {
+                memcpy(data + src_y * rb, tmp + row_idx * rb, rb);
+                row_idx++;
+            }
+        }
+    }
+    free(tmp);
+}
+
 static int channels_for_type(int color_type) {
     switch (color_type) {
     case CT_GRAY:       return 1;
@@ -758,16 +791,33 @@ static int cfde_write(const char *path, const CFDEImage *img) {
     uint32_t bc_hi, bc_lo;
     uint32_t i;
 
-    if (img->compression > 0) {
-        comp_data = cfde_compress(img->pixels, img->pixels_len,
-                                  &comp_len, (int)img->compression, &comp_flags);
+    {
+        uint8_t *src_pixels = img->pixels;
+        uint32_t src_len = img->pixels_len;
+        uint8_t *interlaced = NULL;
+
+        if (img->interlace > 1) {
+            int ch = channels_for_type((int)img->color_type);
+            interlaced = (uint8_t*)malloc(src_len ? src_len : 1);
+            if (!interlaced) return 0;
+            memcpy(interlaced, src_pixels, src_len);
+            interlace_rows(interlaced, img->width, img->height,
+                          (int)img->bit_depth, ch, img->interlace);
+            src_pixels = interlaced;
+        }
+
+        if (img->compression > 0) {
+            comp_data = cfde_compress(src_pixels, src_len,
+                                      &comp_len, (int)img->compression, &comp_flags);
+        } else {
+            comp_data = (uint8_t*)malloc(src_len ? src_len : 1);
+            if (comp_data && src_len) memcpy(comp_data, src_pixels, src_len);
+            comp_len = src_len;
+            comp_flags = 0;
+        }
+
+        if (interlaced) free(interlaced);
         if (!comp_data) return 0;
-    } else {
-        comp_data = (uint8_t*)malloc(img->pixels_len ? img->pixels_len : 1);
-        if (!comp_data) return 0;
-        if (img->pixels_len) memcpy(comp_data, img->pixels, img->pixels_len);
-        comp_len = img->pixels_len;
-        comp_flags = 0;
     }
 
     block_size = img->block_size > 0 ? img->block_size : 65536;
@@ -864,9 +914,10 @@ static int cfde_write(const char *path, const CFDEImage *img) {
     fclose(f);
     free(comp_data);
 
-    printf("! Written: %s (%lux%lu, %dbpp, ct=%d, comp=%d)\n",
+    printf("! Written: %s (%lux%lu, %dbpp, ct=%d, comp=%d, interlace=%d)\n",
            path, (unsigned long)img->width, (unsigned long)img->height,
-           (int)img->bit_depth, (int)img->color_type, (int)img->compression);
+           (int)img->bit_depth, (int)img->color_type, (int)img->compression,
+           (int)img->interlace);
     return 1;
 }
 
@@ -929,6 +980,12 @@ static int cfde_read(const char *path, CFDEImage *img) {
     } else {
         img->pixels     = raw_data;
         img->pixels_len = (uint32_t)data_len;
+    }
+
+    if (img->interlace > 1) {
+        int ch = channels_for_type((int)img->color_type);
+        deinterlace_rows(img->pixels, img->width, img->height,
+                        (int)img->bit_depth, ch, img->interlace);
     }
 
     return 1;
@@ -1078,7 +1135,7 @@ static int save_pnm(const char *path, const uint8_t *data,
 
 static int cmd_from_raw(const char *inpath, const char *outpath,
                         uint32_t width, uint32_t height,
-                        int color_type, int bpp, int compression) {
+                        int color_type, int bpp, int compression, int interlace) {
     FILE *f;
     long file_size;
     uint8_t *raw;
@@ -1091,7 +1148,12 @@ static int cmd_from_raw(const char *inpath, const char *outpath,
     fseek(f, 0, SEEK_END); file_size = ftell(f); fseek(f, 0, SEEK_SET);
     raw = (uint8_t*)malloc((size_t)file_size);
     if (!raw) { fclose(f); return 0; }
-    fread(raw, 1, (size_t)file_size, f);
+    if (fread(raw, 1, (size_t)file_size, f) != (size_t)file_size) {
+        fprintf(stderr, "X Read error\n");
+        free(raw);
+        fclose(f);
+        return 0;
+    }
     fclose(f);
 
     expected = row_bytes(width, bpp, channels) * height;
@@ -1103,7 +1165,7 @@ static int cmd_from_raw(const char *inpath, const char *outpath,
     img.bit_depth   = (uint8_t)bpp;
     img.compression = (uint8_t)compression;
     img.filter      = 0;
-    img.interlace   = 0;
+    img.interlace   = (uint8_t)interlace;
     img.block_size  = 65536;
 
     if ((uint32_t)file_size >= expected) {
@@ -1118,13 +1180,13 @@ static int cmd_from_raw(const char *inpath, const char *outpath,
         img.pixels_len = expected;
     }
 
-    printf("> Importing raw: %s (%lux%lu, ct=%d, %dbpp)\n",
-           inpath, (unsigned long)width, (unsigned long)height, color_type, bpp);
+    printf("> Importing raw: %s (%lux%lu, ct=%d, %dbpp, interlace=%d)\n",
+           inpath, (unsigned long)width, (unsigned long)height, color_type, bpp, interlace);
     { int r = cfde_write(outpath, &img); free(img.pixels); return r; }
 }
 
 static int cmd_pnm_to_cfde(const char *inpath, const char *outpath,
-                            int bpp, int compression) {
+                            int bpp, int compression, int interlace) {
     uint32_t w = 0, h = 0;
     int channels = 0;
     uint8_t *rgba8;
@@ -1148,13 +1210,13 @@ static int cmd_pnm_to_cfde(const char *inpath, const char *outpath,
     img.bit_depth   = (uint8_t)bpp;
     img.compression = (uint8_t)compression;
     img.filter      = 0;
-    img.interlace   = 0;
+    img.interlace   = (uint8_t)interlace;
     img.block_size  = 65536;
     img.pixels_len  = plen;
 
-    printf("> Converting PNM: %s -> %s (%lux%lu, ct=%d, %dbpp, comp=%d)\n",
+    printf("> Converting PNM: %s -> %s (%lux%lu, ct=%d, %dbpp, comp=%d, interlace=%d)\n",
            inpath, outpath, (unsigned long)w, (unsigned long)h,
-           color_type, bpp, compression);
+           color_type, bpp, compression, interlace);
     r = cfde_write(outpath, &img);
     free(img.pixels);
     return r;
@@ -1174,10 +1236,10 @@ static int cmd_cfde_to_pnm(const char *inpath, const char *outpath) {
     cfde_image_free(&img);
     if (!rgba8) return 0;
 
-    printf("> Exporting: %s -> %s (%lux%lu, ct=%d, %dbpp)\n",
+    printf("> Exporting: %s -> %s (%lux%lu, ct=%d, %dbpp, interlace=%d)\n",
            inpath, outpath,
            (unsigned long)img.width, (unsigned long)img.height,
-           (int)img.color_type, (int)img.bit_depth);
+           (int)img.color_type, (int)img.bit_depth, (int)img.interlace);
 
     r = save_pnm(outpath, rgba8, img.width, img.height, channels);
     free(rgba8);
@@ -1186,7 +1248,7 @@ static int cmd_cfde_to_pnm(const char *inpath, const char *outpath) {
 
 static int cmd_create(const char *outpath,
                       uint32_t width, uint32_t height,
-                      int color_type, int bpp, int compression,
+                      int color_type, int bpp, int compression, int interlace,
                       const char *type_str,
                       uint8_t r8, uint8_t g8, uint8_t b8) {
     int channels = channels_for_type(color_type);
@@ -1257,14 +1319,14 @@ static int cmd_create(const char *outpath,
     img.bit_depth   = (uint8_t)bpp;
     img.compression = (uint8_t)compression;
     img.filter      = 0;
-    img.interlace   = 0;
+    img.interlace   = (uint8_t)interlace;
     img.block_size  = 65536;
     img.pixels      = cfde_pix;
     img.pixels_len  = plen;
 
-    printf("> Creating: %s (%lux%lu, %s, ct=%d, %dbpp, comp=%d)\n",
+    printf("> Creating: %s (%lux%lu, %s, ct=%d, %dbpp, comp=%d, interlace=%d)\n",
            outpath, (unsigned long)width, (unsigned long)height,
-           type_str, color_type, bpp, compression);
+           type_str, color_type, bpp, compression, interlace);
     res = cfde_write(outpath, &img);
     free(cfde_pix);
     return res;
@@ -1361,12 +1423,70 @@ static int rgb_to_ansi256_bg(uint8_t r, uint8_t g, uint8_t b) {
         db = b - ANSI256_PAL[i][2];
         dist = (uint32_t)(dr*dr + dg*dg + db*db);
         if (dist < best_dist) { best_dist = dist; best = i; }
-        if (dist == 0) return i;                  
+        if (dist == 0) return i;
     }
     return best;
 }
 
-static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
+static char *render_pixel(char *p, int buf_mode,
+                           uint8_t r, uint8_t g, uint8_t b,
+                           int mode, int double_wide,
+                           const char *RAMP, int ramp_len) {
+    int gray, ci;
+    if (buf_mode) {
+        if (mode == VIEW_MODE_FULL) {
+            p += sprintf(p, "\033[48;2;%d;%d;%dm%s\033[0m",
+                         (int)r, (int)g, (int)b, double_wide ? "  " : " ");
+        } else if (mode == VIEW_MODE_ANSI2) {
+            p += sprintf(p, "\033[%dm%s\033[0m",
+                         rgb_to_ansi2_bg(r, g, b), double_wide ? "  " : " ");
+        } else if (mode == VIEW_MODE_ANSI8) {
+            p += sprintf(p, "\033[%dm%s\033[0m",
+                         rgb_to_ansi8_bg(r, g, b), double_wide ? "  " : " ");
+        } else if (mode == VIEW_MODE_ANSI16) {
+            p += sprintf(p, "\033[%dm%s\033[0m",
+                         rgb_to_ansi16_bg(r, g, b), double_wide ? "  " : " ");
+        } else if (mode == VIEW_MODE_ANSI256) {
+            p += sprintf(p, "\033[48;5;%dm%s\033[0m",
+                         rgb_to_ansi256_bg(r, g, b), double_wide ? "  " : " ");
+        } else {
+            gray = (int)((double)r*0.299 + (double)g*0.587 + (double)b*0.114 + 0.5);
+            ci   = (int)((double)gray / 255.0 * (double)(ramp_len - 1) + 0.5);
+            if (ci < 0) ci = 0;
+            if (ci >= ramp_len) ci = ramp_len - 1;
+            *p++ = RAMP[ci];
+            if (double_wide) *p++ = RAMP[ci];
+        }
+    } else {
+        if (mode == VIEW_MODE_FULL) {
+            printf("\033[48;2;%d;%d;%dm%s\033[0m",
+                   (int)r, (int)g, (int)b, double_wide ? "  " : " ");
+        } else if (mode == VIEW_MODE_ANSI2) {
+            printf("\033[%dm%s\033[0m",
+                   rgb_to_ansi2_bg(r, g, b), double_wide ? "  " : " ");
+        } else if (mode == VIEW_MODE_ANSI8) {
+            printf("\033[%dm%s\033[0m",
+                   rgb_to_ansi8_bg(r, g, b), double_wide ? "  " : " ");
+        } else if (mode == VIEW_MODE_ANSI16) {
+            printf("\033[%dm%s\033[0m",
+                   rgb_to_ansi16_bg(r, g, b), double_wide ? "  " : " ");
+        } else if (mode == VIEW_MODE_ANSI256) {
+            printf("\033[48;5;%dm%s\033[0m",
+                   rgb_to_ansi256_bg(r, g, b), double_wide ? "  " : " ");
+        } else {
+            gray = (int)((double)r*0.299 + (double)g*0.587 + (double)b*0.114 + 0.5);
+            ci   = (int)((double)gray / 255.0 * (double)(ramp_len - 1) + 0.5);
+            if (ci < 0) ci = 0;
+            if (ci >= ramp_len) ci = ramp_len - 1;
+            putchar(RAMP[ci]);
+            if (double_wide) putchar(RAMP[ci]);
+        }
+    }
+    return p;
+}
+
+static int cmd_view(const char *path, int mode, int layout, int flush_mode,
+                    int show_interlaced) {
     CFDEImage img;
     uint8_t *rgba8;
     int channels;
@@ -1394,6 +1514,7 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
     printf("=== CFDE Viewer ===\n");
     printf("File       : %s\n", path);
     printf("Dimensions : %lux%lu\n", (unsigned long)img.width, (unsigned long)img.height);
+    printf("Interlace  : %d\n", (int)img.interlace);
     printf("Render Mode: %s\n",
            mode == VIEW_MODE_FULL    ? "24-bit True Color" :
            mode == VIEW_MODE_ANSI2   ? "2-color ANSI (B/W)" :
@@ -1407,17 +1528,73 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
            flush_mode == FLUSH_BUFFER ? "Full Buffer" :
            flush_mode == FLUSH_PIXEL  ? "Pixel-by-Pixel" : "Line-by-Line");
 
+    if (show_interlaced && img.interlace > 1) {
+        uint8_t stride = img.interlace;
+        uint8_t pass;
+        uint32_t ix;
+        int double_wide = (layout == LAYOUT_ASPECT);
+        int cells_per_pixel = double_wide ? 2 : 1;
+        size_t row_buf_bytes = (size_t)img.width * (size_t)cells_per_pixel * 48 + 8;
+        char *lbuf = (char *)malloc(row_buf_bytes);
+        char *lp;                                    
+
+        if (!lbuf) { free(rgba8); cfde_image_free(&img); return 0; }
+
+        printf("\033[2J");
+        fflush(stdout);
+
+        for (pass = 0; pass < stride; pass++) {
+            uint32_t pass_rows = 0;
+            uint32_t tmp_r;
+            for (tmp_r = (uint32_t)pass; tmp_r < img.height; tmp_r += (uint32_t)stride)
+                pass_rows++;
+
+            printf("\033[H");
+            printf("--- Interlace pass %d/%d  (%lu row(s) this pass) ---\n",
+                   (int)pass + 1, (int)stride, (unsigned long)pass_rows);
+            fflush(stdout);
+
+            for (y = pass; y < img.height; y += stride) {
+                int skip_half = (layout == LAYOUT_HALF_VERT && (y % 2) != 0);
+                if (skip_half) continue;
+
+                lp = lbuf;                      
+                for (ix = 0; ix < img.width; ix++) {
+                    px = rgba8 + (y * img.width + ix) * (uint32_t)channels;
+                    switch (channels) {
+                    case 1: r = g = b = px[0]; break;
+                    case 2: r = g = b = px[0]; break;
+                    case 3: r = px[0]; g = px[1]; b = px[2]; break;
+                    case 4: r = px[0]; g = px[1]; b = px[2]; break;
+                    default: r = g = b = px[0]; break;
+                    }
+                    lp = render_pixel(lp, 1, r, g, b, mode, double_wide, RAMP, ramp_len);
+                }
+                lp += sprintf(lp, "\033[0m\n");
+
+                printf("\033[%d;1H", 2 + (int)y);
+                fwrite(lbuf, 1, (size_t)(lp - lbuf), stdout);
+            }
+            fflush(stdout);
+        }
+
+        printf("\033[0m\n\033[999;1H");
+        fflush(stdout);
+        free(lbuf);
+        free(rgba8);
+        cfde_image_free(&img);
+        return 1;
+    }
+
     if (layout == LAYOUT_HALF_VERT) {
         cols = img.width;
-        rows = (img.height + 1) / 2;                                 
-
+        rows = (img.height + 1) / 2;
         buf_size = (size_t)rows * ((size_t)cols * 30 + 8) + 1024;
 
         if (flush_mode == FLUSH_BUFFER) {
             buf = (char *)malloc(buf_size);
             if (!buf) { free(rgba8); cfde_image_free(&img); return 0; }
             p = buf;
-
             for (y = 0; y < img.height; y += 2) {
                 src_y = y;
                 for (x = 0; x < cols; x++) {
@@ -1429,18 +1606,12 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                     case 4: r = px[0]; g = px[1]; b = px[2]; break;
                     default: r = g = b = px[0]; break;
                     }
-
-                    if (mode == VIEW_MODE_FULL) {
-                        p += sprintf(p, "\033[48;2;%d;%d;%dm \033[0m", (int)r, (int)g, (int)b);
-                    } else if (mode == VIEW_MODE_ANSI2) {
-                        p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi2_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI8) {
-                        p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI16) {
-                        p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi16_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI256) {
-                        p += sprintf(p, "\033[48;5;%dm \033[0m", rgb_to_ansi256_bg(r, g, b));
-                    } else {
+                    if (mode == VIEW_MODE_FULL) p += sprintf(p, "\033[48;2;%d;%d;%dm \033[0m", (int)r, (int)g, (int)b);
+                    else if (mode == VIEW_MODE_ANSI2) p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi2_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI8) p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI16) p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi16_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI256) p += sprintf(p, "\033[48;5;%dm \033[0m", rgb_to_ansi256_bg(r, g, b));
+                    else {
                         gray = (int)((double)r*0.299 + (double)g*0.587 + (double)b*0.114 + 0.5);
                         ci = (int)((double)gray / 255.0 * (double)(ramp_len - 1) + 0.5);
                         if (ci < 0) ci = 0;
@@ -1452,15 +1623,12 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
             }
             fwrite(buf, 1, (size_t)(p - buf), stdout);
             free(buf);
-
         } else if (flush_mode == FLUSH_LINE) {
             buf_size = (size_t)cols * 30 + 32;
             buf = (char *)malloc(buf_size);
             if (!buf) { free(rgba8); cfde_image_free(&img); return 0; }
-
             for (y = 0; y < img.height; y += 2) {
-                src_y = y;
-                p = buf;
+                src_y = y; p = buf;
                 for (x = 0; x < cols; x++) {
                     px = rgba8 + (src_y * img.width + x) * (uint32_t)channels;
                     switch (channels) {
@@ -1470,18 +1638,12 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                     case 4: r = px[0]; g = px[1]; b = px[2]; break;
                     default: r = g = b = px[0]; break;
                     }
-
-                    if (mode == VIEW_MODE_FULL) {
-                        p += sprintf(p, "\033[48;2;%d;%d;%dm \033[0m", (int)r, (int)g, (int)b);
-                    } else if (mode == VIEW_MODE_ANSI2) {
-                        p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI8) {
-                        p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI16) {
-                        p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi16_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI256) {
-                        p += sprintf(p, "\033[48;5;%dm \033[0m", rgb_to_ansi256_bg(r, g, b));
-                    } else {
+                    if (mode == VIEW_MODE_FULL) p += sprintf(p, "\033[48;2;%d;%d;%dm \033[0m", (int)r, (int)g, (int)b);
+                    else if (mode == VIEW_MODE_ANSI2) p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi2_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI8) p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI16) p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi16_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI256) p += sprintf(p, "\033[48;5;%dm \033[0m", rgb_to_ansi256_bg(r, g, b));
+                    else {
                         gray = (int)((double)r*0.299 + (double)g*0.587 + (double)b*0.114 + 0.5);
                         ci = (int)((double)gray / 255.0 * (double)(ramp_len - 1) + 0.5);
                         if (ci < 0) ci = 0;
@@ -1493,8 +1655,7 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                 fwrite(buf, 1, (size_t)(p - buf), stdout);
             }
             free(buf);
-
-        } else {                  
+        } else {
             for (y = 0; y < img.height; y += 2) {
                 src_y = y;
                 for (x = 0; x < cols; x++) {
@@ -1506,18 +1667,12 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                     case 4: r = px[0]; g = px[1]; b = px[2]; break;
                     default: r = g = b = px[0]; break;
                     }
-
-                    if (mode == VIEW_MODE_FULL) {
-                        printf("\033[48;2;%d;%d;%dm \033[0m", (int)r, (int)g, (int)b);
-                    } else if (mode == VIEW_MODE_ANSI2) {
-                        printf("\033[%dm  \033[0m", rgb_to_ansi2_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI8) {
-                        printf("\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI16) {
-                        printf("\033[%dm  \033[0m", rgb_to_ansi16_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI256) {
-                        printf("\033[48;5;%dm \033[0m", rgb_to_ansi256_bg(r, g, b));
-                    } else {
+                    if (mode == VIEW_MODE_FULL) printf("\033[48;2;%d;%d;%dm \033[0m", (int)r, (int)g, (int)b);
+                    else if (mode == VIEW_MODE_ANSI2) printf("\033[%dm  \033[0m", rgb_to_ansi2_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI8) printf("\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI16) printf("\033[%dm  \033[0m", rgb_to_ansi16_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI256) printf("\033[48;5;%dm \033[0m", rgb_to_ansi256_bg(r, g, b));
+                    else {
                         gray = (int)((double)r*0.299 + (double)g*0.587 + (double)b*0.114 + 0.5);
                         ci = (int)((double)gray / 255.0 * (double)(ramp_len - 1) + 0.5);
                         if (ci < 0) ci = 0;
@@ -1528,6 +1683,8 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                 putchar('\n');
             }
         }
+        printf("\033[0m\n\033[999;1H");
+        fflush(stdout);
         free(rgba8);
         cfde_image_free(&img);
         return 1;
@@ -1535,14 +1692,12 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
 
     if (layout == LAYOUT_FULL_STRETCHED) {
         cols = img.width;
-
         buf_size = (size_t)img.height * ((size_t)cols * 30 + 8) + 1024;
 
         if (flush_mode == FLUSH_BUFFER) {
             buf = (char *)malloc(buf_size);
             if (!buf) { free(rgba8); cfde_image_free(&img); return 0; }
             p = buf;
-
             for (y = 0; y < img.height; y++) {
                 for (x = 0; x < cols; x++) {
                     px = rgba8 + (y * img.width + x) * (uint32_t)channels;
@@ -1553,18 +1708,12 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                     case 4: r = px[0]; g = px[1]; b = px[2]; break;
                     default: r = g = b = px[0]; break;
                     }
-
-                    if (mode == VIEW_MODE_FULL) {
-                        p += sprintf(p, "\033[48;2;%d;%d;%dm \033[0m", (int)r, (int)g, (int)b);
-                    } else if (mode == VIEW_MODE_ANSI2) {
-                        p += sprintf(p, "\033[%dm \033[0m", rgb_to_ansi2_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI8) {
-                        p += sprintf(p, "\033[%dm \033[0m", rgb_to_ansi8_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI16) {
-                        p += sprintf(p, "\033[%dm \033[0m", rgb_to_ansi16_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI256) {
-                        p += sprintf(p, "\033[48;5;%dm \033[0m", rgb_to_ansi256_bg(r, g, b));
-                    } else {
+                    if (mode == VIEW_MODE_FULL) p += sprintf(p, "\033[48;2;%d;%d;%dm \033[0m", (int)r, (int)g, (int)b);
+                    else if (mode == VIEW_MODE_ANSI2) p += sprintf(p, "\033[%dm \033[0m", rgb_to_ansi2_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI8) p += sprintf(p, "\033[%dm \033[0m", rgb_to_ansi8_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI16) p += sprintf(p, "\033[%dm \033[0m", rgb_to_ansi16_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI256) p += sprintf(p, "\033[48;5;%dm \033[0m", rgb_to_ansi256_bg(r, g, b));
+                    else {
                         gray = (int)((double)r*0.299 + (double)g*0.587 + (double)b*0.114 + 0.5);
                         ci = (int)((double)gray / 255.0 * (double)(ramp_len - 1) + 0.5);
                         if (ci < 0) ci = 0;
@@ -1576,12 +1725,10 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
             }
             fwrite(buf, 1, (size_t)(p - buf), stdout);
             free(buf);
-
         } else if (flush_mode == FLUSH_LINE) {
             buf_size = (size_t)cols * 30 + 32;
             buf = (char *)malloc(buf_size);
             if (!buf) { free(rgba8); cfde_image_free(&img); return 0; }
-
             for (y = 0; y < img.height; y++) {
                 p = buf;
                 for (x = 0; x < cols; x++) {
@@ -1593,18 +1740,12 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                     case 4: r = px[0]; g = px[1]; b = px[2]; break;
                     default: r = g = b = px[0]; break;
                     }
-
-                    if (mode == VIEW_MODE_FULL) {
-                        p += sprintf(p, "\033[48;2;%d;%d;%dm \033[0m", (int)r, (int)g, (int)b);
-                    } else if (mode == VIEW_MODE_ANSI2) {
-                        p += sprintf(p, "\033[%dm \033[0m", rgb_to_ansi2_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI8) {
-                        p += sprintf(p, "\033[%dm \033[0m", rgb_to_ansi8_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI16) {
-                        p += sprintf(p, "\033[%dm \033[0m", rgb_to_ansi16_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI256) {
-                        p += sprintf(p, "\033[48;5;%dm \033[0m", rgb_to_ansi256_bg(r, g, b));
-                    } else {
+                    if (mode == VIEW_MODE_FULL) p += sprintf(p, "\033[48;2;%d;%d;%dm \033[0m", (int)r, (int)g, (int)b);
+                    else if (mode == VIEW_MODE_ANSI2) p += sprintf(p, "\033[%dm \033[0m", rgb_to_ansi2_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI8) p += sprintf(p, "\033[%dm \033[0m", rgb_to_ansi8_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI16) p += sprintf(p, "\033[%dm \033[0m", rgb_to_ansi16_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI256) p += sprintf(p, "\033[48;5;%dm \033[0m", rgb_to_ansi256_bg(r, g, b));
+                    else {
                         gray = (int)((double)r*0.299 + (double)g*0.587 + (double)b*0.114 + 0.5);
                         ci = (int)((double)gray / 255.0 * (double)(ramp_len - 1) + 0.5);
                         if (ci < 0) ci = 0;
@@ -1616,8 +1757,7 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                 fwrite(buf, 1, (size_t)(p - buf), stdout);
             }
             free(buf);
-
-        } else {                  
+        } else {
             for (y = 0; y < img.height; y++) {
                 for (x = 0; x < cols; x++) {
                     px = rgba8 + (y * img.width + x) * (uint32_t)channels;
@@ -1628,18 +1768,12 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                     case 4: r = px[0]; g = px[1]; b = px[2]; break;
                     default: r = g = b = px[0]; break;
                     }
-
-                    if (mode == VIEW_MODE_FULL) {
-                        printf("\033[48;2;%d;%d;%dm \033[0m", (int)r, (int)g, (int)b);
-                    } else if (mode == VIEW_MODE_ANSI2) {
-                        printf("\033[%dm \033[0m", rgb_to_ansi2_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI8) {
-                        printf("\033[%dm \033[0m", rgb_to_ansi8_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI16) {
-                        printf("\033[%dm \033[0m", rgb_to_ansi16_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI256) {
-                        printf("\033[48;5;%dm \033[0m", rgb_to_ansi256_bg(r, g, b));
-                    } else {
+                    if (mode == VIEW_MODE_FULL) printf("\033[48;2;%d;%d;%dm \033[0m", (int)r, (int)g, (int)b);
+                    else if (mode == VIEW_MODE_ANSI2) printf("\033[%dm \033[0m", rgb_to_ansi2_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI8) printf("\033[%dm \033[0m", rgb_to_ansi8_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI16) printf("\033[%dm \033[0m", rgb_to_ansi16_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI256) printf("\033[48;5;%dm \033[0m", rgb_to_ansi256_bg(r, g, b));
+                    else {
                         gray = (int)((double)r*0.299 + (double)g*0.587 + (double)b*0.114 + 0.5);
                         ci = (int)((double)gray / 255.0 * (double)(ramp_len - 1) + 0.5);
                         if (ci < 0) ci = 0;
@@ -1650,6 +1784,8 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                 putchar('\n');
             }
         }
+        printf("\033[0m\n\033[999;1H");
+        fflush(stdout);
         free(rgba8);
         cfde_image_free(&img);
         return 1;
@@ -1657,14 +1793,12 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
 
     if (layout == LAYOUT_ASPECT) {
         cols = img.width;
-
         buf_size = (size_t)img.height * ((size_t)cols * 60 + 8) + 1024;
 
         if (flush_mode == FLUSH_BUFFER) {
             buf = (char *)malloc(buf_size);
             if (!buf) { free(rgba8); cfde_image_free(&img); return 0; }
             p = buf;
-
             for (y = 0; y < img.height; y++) {
                 for (x = 0; x < cols; x++) {
                     px = rgba8 + (y * img.width + x) * (uint32_t)channels;
@@ -1675,35 +1809,27 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                     case 4: r = px[0]; g = px[1]; b = px[2]; break;
                     default: r = g = b = px[0]; break;
                     }
-
-                    if (mode == VIEW_MODE_FULL) {
-                        p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", (int)r, (int)g, (int)b);
-                    } else if (mode == VIEW_MODE_ANSI2) {
-                        p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi2_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI8) {
-                        p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI16) {
-                        p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi16_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI256) {
-                        p += sprintf(p, "\033[48;5;%dm  \033[0m", rgb_to_ansi256_bg(r, g, b));
-                    } else {
+                    if (mode == VIEW_MODE_FULL) p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", (int)r, (int)g, (int)b);
+                    else if (mode == VIEW_MODE_ANSI2) p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi2_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI8) p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI16) p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi16_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI256) p += sprintf(p, "\033[48;5;%dm  \033[0m", rgb_to_ansi256_bg(r, g, b));
+                    else {
                         gray = (int)((double)r*0.299 + (double)g*0.587 + (double)b*0.114 + 0.5);
                         ci = (int)((double)gray / 255.0 * (double)(ramp_len - 1) + 0.5);
                         if (ci < 0) ci = 0;
                         if (ci >= ramp_len) ci = ramp_len - 1;
-                        *p++ = RAMP[ci]; *p++ = RAMP[ci];                        
+                        *p++ = RAMP[ci]; *p++ = RAMP[ci];
                     }
                 }
                 *p++ = '\n';
             }
             fwrite(buf, 1, (size_t)(p - buf), stdout);
             free(buf);
-
         } else if (flush_mode == FLUSH_LINE) {
             buf_size = (size_t)cols * 60 + 32;
             buf = (char *)malloc(buf_size);
             if (!buf) { free(rgba8); cfde_image_free(&img); return 0; }
-
             for (y = 0; y < img.height; y++) {
                 p = buf;
                 for (x = 0; x < cols; x++) {
@@ -1715,31 +1841,24 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                     case 4: r = px[0]; g = px[1]; b = px[2]; break;
                     default: r = g = b = px[0]; break;
                     }
-
-                    if (mode == VIEW_MODE_FULL) {
-                        p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", (int)r, (int)g, (int)b);
-                    } else if (mode == VIEW_MODE_ANSI2) {
-                        p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi2_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI8) {
-                        p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI16) {
-                        p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi16_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI256) {
-                        p += sprintf(p, "\033[48;5;%dm  \033[0m", rgb_to_ansi256_bg(r, g, b));
-                    } else {
+                    if (mode == VIEW_MODE_FULL) p += sprintf(p, "\033[48;2;%d;%d;%dm  \033[0m", (int)r, (int)g, (int)b);
+                    else if (mode == VIEW_MODE_ANSI2) p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi2_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI8) p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI16) p += sprintf(p, "\033[%dm  \033[0m", rgb_to_ansi16_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI256) p += sprintf(p, "\033[48;5;%dm  \033[0m", rgb_to_ansi256_bg(r, g, b));
+                    else {
                         gray = (int)((double)r*0.299 + (double)g*0.587 + (double)b*0.114 + 0.5);
                         ci = (int)((double)gray / 255.0 * (double)(ramp_len - 1) + 0.5);
                         if (ci < 0) ci = 0;
                         if (ci >= ramp_len) ci = ramp_len - 1;
-                        *p++ = RAMP[ci]; *p++ = RAMP[ci];                        
+                        *p++ = RAMP[ci]; *p++ = RAMP[ci];
                     }
                 }
                 *p++ = '\n';
                 fwrite(buf, 1, (size_t)(p - buf), stdout);
             }
             free(buf);
-
-        } else {                  
+        } else {
             for (y = 0; y < img.height; y++) {
                 for (x = 0; x < cols; x++) {
                     px = rgba8 + (y * img.width + x) * (uint32_t)channels;
@@ -1750,28 +1869,24 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
                     case 4: r = px[0]; g = px[1]; b = px[2]; break;
                     default: r = g = b = px[0]; break;
                     }
-
-                    if (mode == VIEW_MODE_FULL) {
-                        printf("\033[48;2;%d;%d;%dm  \033[0m", (int)r, (int)g, (int)b);
-                    } else if (mode == VIEW_MODE_ANSI2) {
-                        printf("\033[%dm  \033[0m", rgb_to_ansi2_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI8) {
-                        printf("\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI16) {
-                        printf("\033[%dm  \033[0m", rgb_to_ansi16_bg(r, g, b));
-                    } else if (mode == VIEW_MODE_ANSI256) {
-                        printf("\033[48;5;%dm  \033[0m", rgb_to_ansi256_bg(r, g, b));
-                    } else {
+                    if (mode == VIEW_MODE_FULL) printf("\033[48;2;%d;%d;%dm  \033[0m", (int)r, (int)g, (int)b);
+                    else if (mode == VIEW_MODE_ANSI2) printf("\033[%dm  \033[0m", rgb_to_ansi2_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI8) printf("\033[%dm  \033[0m", rgb_to_ansi8_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI16) printf("\033[%dm  \033[0m", rgb_to_ansi16_bg(r, g, b));
+                    else if (mode == VIEW_MODE_ANSI256) printf("\033[48;5;%dm  \033[0m", rgb_to_ansi256_bg(r, g, b));
+                    else {
                         gray = (int)((double)r*0.299 + (double)g*0.587 + (double)b*0.114 + 0.5);
                         ci = (int)((double)gray / 255.0 * (double)(ramp_len - 1) + 0.5);
                         if (ci < 0) ci = 0;
                         if (ci >= ramp_len) ci = ramp_len - 1;
-                        putchar(RAMP[ci]); putchar(RAMP[ci]);                        
+                        putchar(RAMP[ci]); putchar(RAMP[ci]);
                     }
                 }
                 putchar('\n');
             }
         }
+        printf("\033[0m\n\033[999;1H");
+        fflush(stdout);
         free(rgba8);
         cfde_image_free(&img);
         return 1;
@@ -1799,17 +1914,12 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
             default: r = g = b = px[0]; break;
             }
 
-            if (mode == VIEW_MODE_FULL) {
-                printf("\033[48;2;%d;%d;%dm ", (int)r, (int)g, (int)b);
-            } else if (mode == VIEW_MODE_ANSI2) {
-                printf("\033[%dm  ", rgb_to_ansi2_bg(r, g, b));
-            } else if (mode == VIEW_MODE_ANSI8) {
-                printf("\033[%dm  ", rgb_to_ansi8_bg(r, g, b));
-            } else if (mode == VIEW_MODE_ANSI16) {
-                printf("\033[%dm  ", rgb_to_ansi16_bg(r, g, b));
-            } else if (mode == VIEW_MODE_ANSI256) {
-                printf("\033[48;5;%dm ", rgb_to_ansi256_bg(r, g, b));
-            } else {
+            if (mode == VIEW_MODE_FULL) printf("\033[48;2;%d;%d;%dm ", (int)r, (int)g, (int)b);
+            else if (mode == VIEW_MODE_ANSI2) printf("\033[%dm  ", rgb_to_ansi2_bg(r, g, b));
+            else if (mode == VIEW_MODE_ANSI8) printf("\033[%dm  ", rgb_to_ansi8_bg(r, g, b));
+            else if (mode == VIEW_MODE_ANSI16) printf("\033[%dm  ", rgb_to_ansi16_bg(r, g, b));
+            else if (mode == VIEW_MODE_ANSI256) printf("\033[48;5;%dm ", rgb_to_ansi256_bg(r, g, b));
+            else {
                 gray = (int)((double)r*0.299 + (double)g*0.587 + (double)b*0.114 + 0.5);
                 ci = (int)((double)gray / 255.0 * (double)(ramp_len - 1) + 0.5);
                 if (ci < 0) ci = 0;
@@ -1820,6 +1930,8 @@ static int cmd_view(const char *path, int mode, int layout, int flush_mode) {
         printf("\033[0m\n");
     }
 
+    printf("\033[0m\n\033[999;1H");
+    fflush(stdout);
     free(rgba8);
     cfde_image_free(&img);
     return 1;
@@ -1847,16 +1959,16 @@ static int cmd_info(const char *path) {
 static void print_usage(const char *prog) {
     fprintf(stderr, "CFDE Image Format Tool\n\n");
     fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s convert <input.pnm> <output.cfde> [--bpp=N] [--comp=N]\n", prog);
+    fprintf(stderr, "  %s convert <input.pnm> <output.cfde> [--bpp=N] [--comp=N] [--interlace=N]\n", prog);
     fprintf(stderr, "      Convert PPM/PGM to CFDE\n\n");
     fprintf(stderr, "  %s decode <input.cfde> <output.pnm>\n", prog);
     fprintf(stderr, "      Decode CFDE to PPM/PGM\n\n");
     fprintf(stderr, "  %s raw <input.bin> <output.cfde> --width=N --height=N\n", prog);
-    fprintf(stderr, "          [--color-type=N] [--bpp=N] [--comp=N]\n");
+    fprintf(stderr, "          [--color-type=N] [--bpp=N] [--comp=N] [--interlace=N]\n");
     fprintf(stderr, "      Import raw binary as CFDE (--color-type: 0=gray,2=RGB,4=gray+alpha,6=RGBA)\n\n");
     fprintf(stderr, "  %s create <output.cfde> --width=N --height=N\n", prog);
     fprintf(stderr, "          [--type=gradient|single-colour] [--rgb=RRGGBB]\n");
-    fprintf(stderr, "          [--color-type=N] [--bpp=N] [--comp=N]\n");
+    fprintf(stderr, "          [--color-type=N] [--bpp=N] [--comp=N] [--interlace=N]\n");
     fprintf(stderr, "      Create a synthetic CFDE image\n\n");
     fprintf(stderr, "  %s view <input.cfde>\n", prog);
     fprintf(stderr, "      View CFDE image in terminal (requires one rendering flag)\n");
@@ -1869,6 +1981,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      View Flags:   --half-view   (1:1 pixels, skip every other row for terminal aspect, halves the vertical quality)\n");
     fprintf(stderr, "                    --raw-view    (1 char per pixel, all rows, stretched due to terminal limits)\n");
     fprintf(stderr, "                    --full-view   (2 chars wide per pixel, all rows, correct aspect)\n");
+    fprintf(stderr, "                    --interlaced-view  (show each interlace pass in sequence; requires interlace>1)\n");
     fprintf(stderr, "      Flush Flags:  --buffer      (Full RAM buffer, single fwrite)\n");
     fprintf(stderr, "                    --flush-line  (Line buffer, fwrite per row)\n");
     fprintf(stderr, "                    --flush       (printf per pixel)\n\n");
@@ -1877,6 +1990,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  --bpp=N         Bits per sample (1,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32)\n");
     fprintf(stderr, "  --comp=N        Compression level (0=none..5=hyper)\n");
+    fprintf(stderr, "  --interlace=N   Interlace stride (0=none, 1-255=rearrange rows by stride N)\n");
     fprintf(stderr, "  --color-type=N  0=Gray, 2=RGB, 3=Indexed, 4=Gray+Alpha, 6=RGBA\n");
     fprintf(stderr, "  --width=N       Image width\n");
     fprintf(stderr, "  --height=N      Image height\n");
@@ -1905,7 +2019,7 @@ static int valid_bpp(int bpp) {
 
 int main(int argc, char **argv) {
     const char *cmd, *v;
-    int bpp = 8, comp = 0, color_type = CT_RGB;
+    int bpp = 8, comp = 0, color_type = CT_RGB, interlace = 0;
     uint32_t width = 0, height = 0;
 
     if (argc < 2) { print_usage(argv[0]); return 1; }
@@ -1916,14 +2030,17 @@ int main(int argc, char **argv) {
     if (find_arg_val(argc - 2, argv + 2, "--color-type=", &v) >= 0) color_type = atoi(v);
     if (find_arg_val(argc - 2, argv + 2, "--width=",      &v) >= 0) width      = (uint32_t)atol(v);
     if (find_arg_val(argc - 2, argv + 2, "--height=",     &v) >= 0) height     = (uint32_t)atol(v);
+    if (find_arg_val(argc - 2, argv + 2, "--interlace=",  &v) >= 0) interlace  = atoi(v);
 
     if (!valid_bpp(bpp)) { fprintf(stderr, "X Invalid --bpp=%d\n", bpp); return 1; }
     if (comp < 0) comp = 0;
     if (comp > 5) comp = 5;
+    if (interlace < 0) interlace = 0;
+    if (interlace > 255) interlace = 255;
 
     if (strcmp(cmd, "convert") == 0) {
         if (argc < 4) { print_usage(argv[0]); return 1; }
-        return cmd_pnm_to_cfde(argv[2], argv[3], bpp, comp) ? 0 : 1;
+        return cmd_pnm_to_cfde(argv[2], argv[3], bpp, comp, interlace) ? 0 : 1;
     }
 
     if (strcmp(cmd, "decode") == 0) {
@@ -1938,7 +2055,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         return cmd_from_raw(argv[2], argv[3], width, height,
-                            color_type, bpp, comp) ? 0 : 1;
+                            color_type, bpp, comp, interlace) ? 0 : 1;
     }
 
     if (strcmp(cmd, "create") == 0) {
@@ -1959,7 +2076,7 @@ int main(int argc, char **argv) {
             r8 = (uint8_t)((double)r8*0.299 + (double)g8*0.587 + (double)b8*0.114 + 0.5);
         }
 
-        return cmd_create(argv[2], width, height, color_type, bpp, comp,
+        return cmd_create(argv[2], width, height, color_type, bpp, comp, interlace,
                           type_str, r8, g8, b8) ? 0 : 1;
     }
 
@@ -1967,6 +2084,7 @@ int main(int argc, char **argv) {
         int view_mode = VIEW_MODE_NONE;
         int flush_mode = FLUSH_NONE;
         int layout = LAYOUT_NONE;
+        int show_interlaced = 0;
 
         if (argc < 3) { print_usage(argv[0]); return 1; }
 
@@ -1976,9 +2094,10 @@ int main(int argc, char **argv) {
         if (find_arg_val(argc - 2, argv + 2, "--ansi-16",         NULL) >= 0) view_mode = VIEW_MODE_ANSI16;
         if (find_arg_val(argc - 2, argv + 2, "--ansi-256",        NULL) >= 0) view_mode = VIEW_MODE_ANSI256;
         if (find_arg_val(argc - 2, argv + 2, "--grayscale",       NULL) >= 0) view_mode = VIEW_MODE_GRAY;
-        if (find_arg_val(argc - 2, argv + 2, "--half-view",  NULL) >= 0) layout = LAYOUT_HALF_VERT;
-        if (find_arg_val(argc - 2, argv + 2, "--raw-view",       NULL) >= 0) layout = LAYOUT_FULL_STRETCHED;
-        if (find_arg_val(argc - 2, argv + 2, "--full-view",     NULL) >= 0) layout = LAYOUT_ASPECT;
+        if (find_arg_val(argc - 2, argv + 2, "--half-view",       NULL) >= 0) layout = LAYOUT_HALF_VERT;
+        if (find_arg_val(argc - 2, argv + 2, "--raw-view",        NULL) >= 0) layout = LAYOUT_FULL_STRETCHED;
+        if (find_arg_val(argc - 2, argv + 2, "--full-view",       NULL) >= 0) layout = LAYOUT_ASPECT;
+        if (find_arg_val(argc - 2, argv + 2, "--interlaced-view", NULL) >= 0) show_interlaced = 1;
 
         if (find_arg_val(argc - 2, argv + 2, "--buffer",          NULL) >= 0) flush_mode = FLUSH_BUFFER;
         if (find_arg_val(argc - 2, argv + 2, "--flush",           NULL) >= 0) flush_mode = FLUSH_PIXEL;
@@ -1992,7 +2111,7 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        return cmd_view(argv[2], view_mode, layout, flush_mode) ? 0 : 1;
+        return cmd_view(argv[2], view_mode, layout, flush_mode, show_interlaced) ? 0 : 1;
     }
 
     if (strcmp(cmd, "info") == 0) {
