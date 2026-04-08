@@ -61,4 +61,4 @@ Options:
 ```
 
 # License
-MIT License, all rights reserved. More licensing information in the LICENSE file in the repository's root directory
+MIT License. More licensing information in the LICENSE file in the repository's root directory
